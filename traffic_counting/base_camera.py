@@ -80,14 +80,15 @@ class BaseCamera:
 
     @classmethod
     def get_frame(cls, unique_name):
-        """Return the current camera frame."""
+        """Return the current camera frame, or None if not available yet."""
         BaseCamera.last_access[unique_name] = time.time()
 
         # wait for a signal from the camera thread
         BaseCamera.event[unique_name].wait()
         BaseCamera.event[unique_name].clear()
 
-        return BaseCamera.frame[unique_name]
+        return BaseCamera.frame.get(unique_name)  # <-- safe lookup
+
 
     @staticmethod
     def frames():

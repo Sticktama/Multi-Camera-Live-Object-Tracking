@@ -1,16 +1,16 @@
 from imutils.video import VideoStream
 import imagezmq
+import time
 
+# Use 0 for default webcam (change to 1, 2... if you have multiple cameras)
+cap = VideoStream(src=0)
 
-path = "rtsp://192.168.1.70:8080//h264_ulaw.sdp"  # change to your IP stream address
-cap = VideoStream(path)
-
-sender = imagezmq.ImageSender(connect_to='tcp://localhost:5555')  # change to IP address and port of server thread
-cam_id = 'Camera 1'  # this name will be displayed on the corresponding camera stream
+sender = imagezmq.ImageSender(connect_to='tcp://localhost:5555')  # change to server IP:port
+cam_id = 'Webcam 1'  # identifier for this camera
 
 stream = cap.start()
+time.sleep(2.0)  # let the camera warm up
 
 while True:
-
     frame = stream.read()
     sender.send_image(cam_id, frame)
