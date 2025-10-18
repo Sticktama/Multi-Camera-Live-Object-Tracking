@@ -19,7 +19,7 @@ from keras.utils import multi_gpu_model
 import tensorflow as tf
 config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
-session = tf.Session(config=config)
+session = tf.compat.v1.Session(config=config)
 """
 
 class YOLO(object):
@@ -33,7 +33,7 @@ class YOLO(object):
         self.class_names = self._get_class()
         self.anchors = self._get_anchors()
         self.sess = K.get_session()
-        self.model_image_size = (416, 416)  # fixed size or (None, None)
+        self.model_image_size = (608, 608)  # fixed size or (None, None)
         self.is_fixed_size = self.model_image_size != (None, None)
         self.boxes, self.scores, self.classes = self.generate()
 

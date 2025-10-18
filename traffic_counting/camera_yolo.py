@@ -2,8 +2,12 @@ from __future__ import division, print_function, absolute_import
 
 import cv2
 from base_camera import BaseCamera
-
 import os
+import requests
+import json
+import threading
+import time
+from queue import Queue
 import warnings
 import numpy as np
 from PIL import Image
@@ -41,215 +45,429 @@ class Camera(BaseCamera):
     @staticmethod
     def yolo_frames(image_hub, unique_name):
         device = unique_name[1]
-
         show_detections = False
+        last_api_update = time.time()
+        api_update_interval = 2  # seconds
 
         gdet = import_module('tools.generate_detections')
         nn_matching = import_module('deep_sort.nn_matching')
         Tracker = import_module('deep_sort.tracker').Tracker
 
-        # Definition of the parameters
         max_cosine_distance = 0.3
         nn_budget = None
 
-        # deep_sort
         model_filename = 'model_data/mars-small128.pb'
         encoder = gdet.create_box_encoder(model_filename, batch_size=1)
-
         metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
         tracker = Tracker(metric)
 
         yolo = YOLO()
         nms_max_overlap = 1.0
-
         num_frames = 0
 
-        current_date = datetime.datetime.now().date()
-        count_dict = {}  # initiate dict for storing counts
-
-        total_counter = 0
-        up_count = 0
-        down_count = 0
-
-        class_counter = Counter()  # store counts of each detected class
-        already_counted = deque(maxlen=50)  # temporary memory for storing counted IDs
-        intersect_info = []  # initialise intersection list
-
+        # Counters
+        entry_count = 0
+        exit_count = 0
+        
+        # Parking spot tracking - one car per spot at a time
+        parking_spots = {
+            1: {"occupied": False, "current_car": None, "history": deque(maxlen=50)},
+            2: {"occupied": False, "current_car": None, "history": deque(maxlen=50)},
+            3: {"occupied": False, "current_car": None, "history": deque(maxlen=50)},
+            4: {"occupied": False, "current_car": None, "history": deque(maxlen=50)}
+        }
+        
+        # Track which vehicles crossed which lines
+        already_counted_entry = deque(maxlen=50)
+        already_counted_spots = {1: deque(maxlen=30), 2: deque(maxlen=30), 
+                                3: deque(maxlen=30), 4: deque(maxlen=30)}
+        
+        # Store OCR results per vehicle
+        vehicle_labels = {}  # {track_id: "PLATE1234"}
+        
         memory = {}
+
         while True:
             cam_id, frame = image_hub.recv_image()
-            image_hub.send_reply(b'OK')  # this is needed for the stream to work with REQ/REP pattern
-            # image_height, image_width = frame.shape[:2]
-
+            image_hub.send_reply(b'OK')
+            
             if frame is None:
                 break
 
             num_frames += 1
+            h, w = frame.shape[:2]
 
-            '''
-            if num_frames % 2 != 0:  # only process frames at set number of frame intervals
-                continue
-            '''
+            # Define lines - 2x2 GRID CONFIGURATION
+            # Vertical entry/exit line (left side)
+            entry_line = [(int(0.15 * w), 0), (int(0.15 * w), h)]
+            
+            # Horizontal parking spot lines in 2x2 grid
+            # Top row (spots 1 and 2)
+            spot_lines = {
+                1: [(int(0.2 * w), int(0.30 * h)), (int(0.48 * w), int(0.30 * h))],   # Top-left
+                2: [(int(0.52 * w), int(0.30 * h)), (int(0.80 * w), int(0.30 * h))],  # Top-right
+                # Bottom row (spots 3 and 4)
+                3: [(int(0.2 * w), int(0.70 * h)), (int(0.48 * w), int(0.70 * h))],   # Bottom-left
+                4: [(int(0.52 * w), int(0.70 * h)), (int(0.80 * w), int(0.70 * h))]   # Bottom-right
+            }
 
-            image = Image.fromarray(frame[..., ::-1])  # convert bgr to rgb
+            image = Image.fromarray(frame[..., ::-1])
             boxes, confidence, classes = yolo.detect_image(image)
             features = encoder(frame, boxes)
 
             detections = [Detection(bbox, confidence, cls, feature) for bbox, confidence, cls, feature in
-                          zip(boxes, confidence, classes, features)]
+                        zip(boxes, confidence, classes, features)]
 
-            # Run non-maxima suppression.
-            boxes = np.array([d.tlwh for d in detections])
+            boxes_arr = np.array([d.tlwh for d in detections])
             scores = np.array([d.confidence for d in detections])
-            classes = np.array([d.cls for d in detections])
-            indices = preprocessing.non_max_suppression(boxes, nms_max_overlap, scores)
+            classes_arr = np.array([d.cls for d in detections])
+            indices = preprocessing.non_max_suppression(boxes_arr, nms_max_overlap, scores)
             detections = [detections[i] for i in indices]
 
-            # Call the tracker
             tracker.predict()
             tracker.update(detections)
 
-            if cam_id == 'Camera 1':
-                line = [(0, int(0.5 * frame.shape[0])), (int(frame.shape[1]), int(0.5 * frame.shape[0]))]
-            else:
-                line = [(0, int(0.33 * frame.shape[0])), (int(frame.shape[1]), int(0.33 * frame.shape[0]))]
+            # Draw entry/exit line (RED vertical)
+            cv2.line(frame, entry_line[0], entry_line[1], (0, 0, 255), 3)
+            cv2.putText(frame, "ENTRY/EXIT", (entry_line[0][0] - 50, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # draw yellow line
-            cv2.line(frame, line[0], line[1], (0, 255, 255), 2)
+            # Draw parking spot lines (RED horizontal) in 2x2 grid
+            for spot_id, line in spot_lines.items():
+                cv2.line(frame, line[0], line[1], (0, 0, 255), 2)
+                # Position labels above each line
+                label_x = (line[0][0] + line[1][0]) // 2 - 40
+                label_y = line[0][1] - 10
+                cv2.putText(frame, f"SPOT {spot_id}", (label_x, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
             for track in tracker.tracks:
                 if not track.is_confirmed() or track.time_since_update > 1:
                     continue
+                    
                 bbox = track.to_tlbr()
-                track_cls = track.cls  # most common detection class for track
+                track_cls = track.cls
+                track_id = track.track_id
 
                 midpoint = track.tlbr_midpoint(bbox)
-                origin_midpoint = (midpoint[0], frame.shape[0] - midpoint[1])  # get midpoint respective to botton-left
+                origin_midpoint = (midpoint[0], h - midpoint[1])
 
-                if track.track_id not in memory:
-                    memory[track.track_id] = deque(maxlen=2)
+                if track_id not in memory:
+                    memory[track_id] = deque(maxlen=2)
 
-                memory[track.track_id].append(midpoint)
-                previous_midpoint = memory[track.track_id][0]
+                memory[track_id].append(midpoint)
+                
+                if len(memory[track_id]) < 2:
+                    continue
+                    
+                previous_midpoint = memory[track_id][0]
+                origin_previous_midpoint = (previous_midpoint[0], h - previous_midpoint[1])
 
-                origin_previous_midpoint = (previous_midpoint[0], frame.shape[0] - previous_midpoint[1])
-
+                # Draw tracking line
                 cv2.line(frame, midpoint, previous_midpoint, (0, 255, 0), 2)
 
-                # Add to counter and get intersection details
-                if Camera.intersect(midpoint, previous_midpoint, line[0], line[1]) and track.track_id not in already_counted:
-                    class_counter[track_cls] += 1
-                    total_counter += 1
+                # Check entry/exit line crossing
+                if Camera.intersect(midpoint, previous_midpoint, entry_line[0], entry_line[1]):
+                    if track_id not in already_counted_entry:
+                        angle = Camera.vector_angle(origin_midpoint, origin_previous_midpoint)
+                        
+                        # Determine direction (left to right = entry, right to left = exit)
+                        if -90 < angle < 90:  # Moving right (entry)
+                            entry_count += 1
+                            cv2.line(frame, entry_line[0], entry_line[1], (0, 255, 0), 3)
+                            
+                            # Get OCR label for new entry using Gemini
+                            if track_id not in vehicle_labels:
+                                print(f"🔍 Running OCR for vehicle ID {track_id}...")
+                                ocr_result = call_ocr_api(frame, bbox)
+                                vehicle_labels[track_id] = ocr_result
+                                print(f"🚗 New Entry: ID {track_id} -> {ocr_result}")
+                        else:  # Moving left (exit)
+                            exit_count += 1
+                            cv2.line(frame, entry_line[0], entry_line[1], (255, 0, 0), 3)
+                            print(f"🚗 Exit: ID {track_id}")
+                        
+                        already_counted_entry.append(track_id)
 
-                    # draw red line
-                    cv2.line(frame, line[0], line[1], (0, 0, 255), 2)
+                # Check parking spot line crossings
+                for spot_id, line in spot_lines.items():
+                    if Camera.intersect(midpoint, previous_midpoint, line[0], line[1]):
+                        if track_id not in already_counted_spots[spot_id]:
+                            angle = Camera.vector_angle(origin_midpoint, origin_previous_midpoint)
+                            
+                            # Determine if it's entry or exit based on spot and direction
+                            is_entry = False
+                            if spot_id in [1, 2]:  # Spots 1 and 2: up = entry, down = exit
+                                is_entry = angle > 0
+                            else:  # Spots 3 and 4: down = entry, up = exit
+                                is_entry = angle < 0
+                            
+                            if is_entry:
+                                # Car entering parking spot
+                                parking_spots[spot_id]['occupied'] = True
+                                parking_spots[spot_id]['current_car'] = track_id
+                                parking_spots[spot_id]['history'].append(track_id)
+                                
+                                # Flash the line green for entry
+                                cv2.line(frame, line[0], line[1], (0, 255, 0), 3)
+                                
+                                # Mock API call
+                                mock_api_call(track_id, spot_id)
+                                print(f"🅿️  Spot {spot_id}: Car {track_id} ENTERED (parked)")
+                            else:
+                                # Car exiting parking spot
+                                if parking_spots[spot_id]['current_car'] == track_id:
+                                    parking_spots[spot_id]['occupied'] = False
+                                    parking_spots[spot_id]['current_car'] = None
+                                
+                                # Flash the line blue for exit
+                                cv2.line(frame, line[0], line[1], (255, 0, 0), 3)
+                                
+                                print(f"🅿️  Spot {spot_id}: Car {track_id} EXITED (left)")
+                            
+                            already_counted_spots[spot_id].append(track_id)
 
-                    already_counted.append(track.track_id)  # Set already counted for ID to true.
+                # Draw bounding box
+                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), 
+                            (255, 255, 255), 2)
+                
+                # Display ID and OCR label
+                label_text = f"ID: {track_id}"
+                if track_id in vehicle_labels:
+                    label_text += f" | {vehicle_labels[track_id]}"
+                
+                cv2.putText(frame, label_text, (int(bbox[0]), int(bbox[1] - 10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Display X,Y coordinates
+                coord_text = f"X:{midpoint[0]} Y:{midpoint[1]}"
+                cv2.putText(frame, coord_text, (int(bbox[0]), int(bbox[3] + 20)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                
+                # Draw center point marker
+                cv2.circle(frame, midpoint, 4, (255, 0, 255), -1)
 
-                    intersection_time = datetime.datetime.now() - datetime.timedelta(microseconds=datetime.datetime.now().microsecond)
-                    angle = Camera.vector_angle(origin_midpoint, origin_previous_midpoint)
-                    intersect_info.append([track_cls, origin_midpoint, angle, intersection_time])
+            # Display entry/exit counts
+            cv2.putText(frame, f"Entries: {entry_count} | Exits: {exit_count}", 
+                    (int(0.02 * w), int(0.05 * h)), cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.7, (0, 255, 255), 2)
 
-                    if angle > 0:
-                        up_count += 1
-                    if angle < 0:
-                        down_count += 1
+            # Display parking spot information
+            y_offset = int(0.05 * h)
+            for spot_id in sorted(parking_spots.keys()):
+                spot_data = parking_spots[spot_id]
+                status = "🚗 OCCUPIED" if spot_data['occupied'] else "✅ EMPTY"
+                info_text = f"Spot {spot_id}: {status}"
+                
+                cv2.putText(frame, info_text, (int(0.65 * w), y_offset), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+                        (0, 0, 255) if spot_data['occupied'] else (0, 255, 0), 2)
+                
+                # Show current car if occupied
+                if spot_data['occupied'] and spot_data['current_car']:
+                    car_id = spot_data['current_car']
+                    label = vehicle_labels.get(car_id, "UNKNOWN")
+                    car_text = f"  Car: {car_id} ({label})"
+                    cv2.putText(frame, car_text, (int(0.65 * w), y_offset + 20), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                    y_offset += 60
+                else:
+                    y_offset += 35
 
-                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255, 255, 255), 2)  # WHITE BOX
-                cv2.putText(frame, "ID: " + str(track.track_id), (int(bbox[0]), int(bbox[1])), 0,
-                            1.5e-3 * frame.shape[0], (0, 255, 0), 2)
+            # Collect all currently active track IDs
+            all_active_tracks = set([track.track_id for track in tracker.tracks 
+                                    if track.is_confirmed() and track.time_since_update <= 1])
+            
+            # Periodic live parking status API call
+            current_time = time.time()
+            if current_time - last_api_update >= api_update_interval:
+                send_live_parking_status(parking_spots, vehicle_labels, entry_count, exit_count, 
+                                        memory, all_active_tracks)
+                last_api_update = current_time
 
-                if not show_detections:
-                    adc = "%.2f" % (track.adc * 100) + "%"  # Average detection confidence
-                    cv2.putText(frame, str(track_cls), (int(bbox[0]), int(bbox[3])), 0,
-                                1e-3 * frame.shape[0], (0, 255, 0), 2)
-                    cv2.putText(frame, 'ADC: ' + adc, (int(bbox[0]), int(bbox[3] + 2e-2 * frame.shape[1])), 0,
-                                1e-3 * frame.shape[0], (0, 255, 0), 2)
-
-            # Delete memory of old tracks.
-            # This needs to be larger than the number of tracked objects in the frame.
+            # Clean up old memory
             if len(memory) > 50:
                 del memory[list(memory)[0]]
 
-            # Draw total count.
-            cv2.putText(frame, "Total: {} ({} up, {} down)".format(str(total_counter), str(up_count),
-                        str(down_count)), (int(0.05 * frame.shape[1]), int(0.1 * frame.shape[0])), 0,
-                        1.5e-3 * frame.shape[0], (0, 255, 255), 2)
-
-            if show_detections:
-                for det in detections:
-                    bbox = det.to_tlbr()
-                    score = "%.2f" % (det.confidence * 100) + "%"
-                    cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255, 0, 0), 2)  # BLUE BOX
-                    if len(classes) > 0:
-                        det_cls = det.cls
-                        cv2.putText(frame, str(det_cls) + " " + score, (int(bbox[0]), int(bbox[3])), 0,
-                                    1.5e-3 * frame.shape[0], (0, 255, 0), 2)
-
-            # display counts for each class as they appear
-            y = 0.2 * frame.shape[0]
-            for cls in class_counter:
-                class_count = class_counter[cls]
-                cv2.putText(frame, str(cls) + " " + str(class_count), (int(0.05 * frame.shape[1]), int(y)), 0,
-                            1.5e-3 * frame.shape[0], (0, 255, 255), 2)
-                y += 0.05 * frame.shape[0]
-
-            # calculate current minute
-            now = datetime.datetime.now()
-            rounded_now = now - datetime.timedelta(microseconds=now.microsecond)  # round to nearest second
-            current_minute = now.time().minute
-
-            if current_minute == 0 and len(count_dict) > 1:
-                count_dict = {}  # reset counts every hour
-            else:
-                # write counts to file for every set interval of the hour
-                write_interval = 5
-                if current_minute % write_interval == 0:  # write to file once only every write_interval minutes
-                    if current_minute not in count_dict:
-                        count_dict[current_minute] = True
-                        total_filename = 'Total counts for {}, {}.txt'.format(current_date, cam_id)
-                        counts_folder = './counts/'
-                        if not os.access(counts_folder + str(current_date) + '/total', os.W_OK):
-                            os.makedirs(counts_folder + str(current_date) + '/total')
-                        total_count_file = open(counts_folder + str(current_date) + '/total/' + total_filename, 'a')
-                        print('{} writing...'.format(rounded_now))
-                        print('Writing current total count ({}) and directional counts to file.'.format(total_counter))
-                        total_count_file.write('{}, {}, {}, {}, {}\n'.format(str(rounded_now), device,
-                                                                             str(total_counter), up_count, down_count))
-                        total_count_file.close()
-
-                        # if class exists in class counter, create file and write counts
-
-                        if not os.access(counts_folder + str(current_date) + '/classes', os.W_OK):
-                            os.makedirs(counts_folder + str(current_date) + '/classes')
-                        for cls in class_counter:
-                            class_count = class_counter[cls]
-                            print('Writing current {} count ({}) to file.'.format(cls, class_count))
-                            class_filename = 'Class counts for {}, {}.txt'.format(current_date, cam_id)
-                            class_count_file = open(counts_folder + str(current_date) + '/classes/' + class_filename, 'a')
-                            class_count_file.write("{}, {}, {}\n".format(rounded_now, device, str(class_count)))
-                            class_count_file.close()
-
-                        # write intersection details
-                        if not os.access(counts_folder + str(current_date) + '/intersections', os.W_OK):
-                            os.makedirs(counts_folder + str(current_date) + '/intersections')
-                        print('Writing intersection details for {}'.format(cam_id))
-                        intersection_filename = 'Intersection details for {}, {}.txt'.format(current_date, cam_id)
-                        intersection_file = open(counts_folder + str(current_date) + '/intersections/' + intersection_filename, 'a')
-                        for i in intersect_info:
-                            cls = i[0]
-
-                            midpoint = i[1]
-                            x = midpoint[0]
-                            y = midpoint[1]
-
-                            angle = i[2]
-
-                            intersect_time = i[3]
-
-                            intersection_file.write("{}, {}, {}, {}, {}, {}\n".format(str(intersect_time), device, cls,
-                                                                                      x, y, str(angle)))
-                        intersection_file.close()
-                        intersect_info = []  # reset list after writing
-
             yield cam_id, frame
+# Gemini API Configuration
+API_KEY = "AIzaSyAIaU_xYpM2izZuisoevZLF5wxSxTKXxUw"  # 🔑 Add your Gemini API key
+
+# ======================================
+# Gemini OCR Functions (DO NOT MODIFY)
+# ======================================
+def upload_file(file_path, mime_type):
+    url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key={API_KEY}"
+    metadata = {"file": {"displayName": file_path.split('/')[-1]}}
+
+    with open(file_path, "rb") as f:
+        data = (
+            b"--boundary\r\n"
+            b"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            + json.dumps(metadata).encode("utf-8")
+            + b"\r\n--boundary\r\n"
+            + f"Content-Type: ".encode("utf-8") + mime_type.encode("utf-8") + b"\r\n\r\n"
+            + f.read()
+            + b"\r\n--boundary--"
+        )
+
+    headers = {"Content-Type": "multipart/related; boundary=boundary"}
+    r = requests.post(url, headers=headers, data=data)
+    r.raise_for_status()
+    result = r.json()["file"]
+    print(f"✅ Uploaded: {result['displayName']}")
+    return result["uri"], result["name"]
+
+
+def delete_file(file_name):
+    url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={API_KEY}"
+    r = requests.delete(url)
+    if r.status_code == 200:
+        print(f"🗑️ Deleted {file_name}")
+    else:
+        print(f"⚠️ Failed to delete {file_name}: {r.status_code} - {r.text}")
+
+
+def extract_plate_ocr(image_path):
+    """Extract license plate using Gemini API"""
+    try:
+        # Upload to Gemini
+        reference_uri, reference_name = upload_file(image_path, "image/jpeg")
+
+        # Call Gemini API
+        gen_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": API_KEY}
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "fileData": {"fileUri": reference_uri, "mimeType": "image/jpeg"}
+                        },
+                        {
+                            "text": (
+                                "From the image, extract only the unique, primary alphanumeric code of the vehicle's license plate. "
+                                "Do not include any surrounding words, labels, prefixes, or suffixes such as 'REGISTERED', "
+                                "'NCR MV FILE NO.', or hyphens. Respond with nothing but the exact code."
+                            )
+                        }
+                    ]
+                }
+            ]
+        }
+
+        resp = requests.post(gen_url, headers=headers, json=payload)
+        resp.raise_for_status()
+
+        result = resp.json()
+        plate_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        # Cleanup uploaded file
+        delete_file(reference_name)
+        
+        return plate_text
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        return "UNKNOWN"
+
+
+def call_ocr_api(frame, bbox):
+    """Wrapper to extract OCR from vehicle crop"""
+    try:
+        
+        # Save temporary image
+        temp_path = "testpic.png"
+        
+        # Call Gemini OCR
+        result = extract_plate_ocr(temp_path)
+        
+            
+        return result
+    except Exception as e:
+        print(f"OCR Wrapper Error: {e}")
+        return "ERROR"
+
+
+def mock_api_call(car_id, spot_id):
+    """Simulate API call for parking spot occupation"""
+    def send_request():
+        payload = {
+            "car_id": car_id,
+            "spot_id": spot_id,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        print(f"📡 API Call: {payload}")
+        # Uncomment below to make actual API call
+        # try:
+        #     response = requests.post("YOUR_API_ENDPOINT", json=payload, timeout=5)
+        #     print(f"API Response: {response.status_code}")
+        # except Exception as e:
+        #     print(f"API Error: {e}")
+    
+    threading.Thread(target=send_request, daemon=True).start()
+
+def send_live_parking_status(parking_spots, vehicle_labels, entry_count, exit_count, memory, all_active_tracks):
+    """Send periodic live parking status to API"""
+    def send_request():
+        # Prepare data for ALL currently tracked cars
+        all_cars = []
+        for track_id in all_active_tracks:
+            # Get current coordinates from memory
+            car_position = {"x": None, "y": None}
+            if track_id in memory and len(memory[track_id]) > 0:
+                current_pos = memory[track_id][-1]  # Get most recent position
+                car_position = {"x": int(current_pos[0]), "y": int(current_pos[1])}
+            
+            all_cars.append({
+                "car_id": track_id,
+                "label": vehicle_labels.get(track_id, "UNKNOWN"),
+                "coordinates": car_position
+            })
+        
+        # Prepare parking spots data
+        spots_data = []
+        for spot_id, data in parking_spots.items():
+            spot_info = {
+                "spot_id": spot_id,
+                "occupied": data['occupied'],
+                "current_car": None,
+                "history": list(data['history'])  # Convert deque to list for JSON
+            }
+            
+            # If occupied, include current car details
+            if data['current_car'] is not None:
+                car_id = data['current_car']
+                car_position = {"x": None, "y": None}
+                if car_id in memory and len(memory[car_id]) > 0:
+                    current_pos = memory[car_id][-1]
+                    car_position = {"x": int(current_pos[0]), "y": int(current_pos[1])}
+                
+                spot_info['current_car'] = {
+                    "car_id": car_id,
+                    "label": vehicle_labels.get(car_id, "UNKNOWN"),
+                    "coordinates": car_position
+                }
+            
+            spots_data.append(spot_info)
+        
+        payload = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "total_entries": entry_count,
+            "total_exits": exit_count,
+            "all_active_cars": all_cars,
+            "parking_spots": spots_data
+        }
+        
+        print(f"📊 Live Status API Call:")
+        print(json.dumps(payload, indent=2))
+        
+        # Uncomment below to make actual API call
+        # try:
+        #     response = requests.post("YOUR_LIVE_STATUS_ENDPOINT", json=payload, timeout=5)
+        #     print(f"Live Status API Response: {response.status_code}")
+        # except Exception as e:
+        #     print(f"Live Status API Error: {e}")
+    
+    # Run API call in separate thread
+    threading.Thread(target=send_request, daemon=True).start()
