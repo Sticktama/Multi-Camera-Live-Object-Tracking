@@ -22,12 +22,55 @@ import math
 
 warnings.filterwarnings('ignore')
 
+# ===== SHARED STATE BETWEEN CAMERAS =====
+# This allows Camera 1 to access license plates detected by Camera 0
+SHARED_VEHICLE_DATABASE = {}  # {track_id: {"plate": "ABC123", "timestamp": datetime}}
+DATABASE_LOCK = threading.Lock()
+
+def register_vehicle_plate(track_id, plate_number):
+    """Camera 0 registers a vehicle's plate in shared database"""
+    with DATABASE_LOCK:
+        SHARED_VEHICLE_DATABASE[track_id] = {
+            "plate": plate_number,
+            "timestamp": datetime.datetime.now(),
+            "first_seen_camera": "Camera 0",
+            "assigned": False  # Track if plate has been assigned to Camera 1 vehicle
+        }
+        print(f"📝 Registered to database: ID {track_id} -> {plate_number}")
+
+def get_next_available_plate():
+    """
+    Get the most recent unassigned plate from Camera 0
+    """
+    with DATABASE_LOCK:
+        if not SHARED_VEHICLE_DATABASE:
+            return "UNKNOWN"
+        
+        # Get most recent vehicle from Camera 0 (within last 30 seconds)
+        recent_vehicles = []
+        cutoff_time = datetime.datetime.now() - datetime.timedelta(seconds=30)
+        
+        for track_id, data in SHARED_VEHICLE_DATABASE.items():
+            if data["timestamp"] > cutoff_time and not data.get("assigned", False):
+                recent_vehicles.append((track_id, data["plate"], data["timestamp"]))
+        
+        if recent_vehicles:
+            # Return most recent unassigned plate
+            recent_vehicles.sort(key=lambda x: x[2], reverse=True)
+            cam0_id, plate, _ = recent_vehicles[0]
+            
+            # Mark as assigned
+            SHARED_VEHICLE_DATABASE[cam0_id]["assigned"] = True
+            
+            return plate
+        
+        return "UNKNOWN"
+
 
 class Camera(BaseCamera):
     def __init__(self, feed_type, device, port_list):
         super(Camera, self).__init__(feed_type, device, port_list)
 
-    # Return true if line segments AB and CD intersect
     @staticmethod
     def intersect(A, B, C, D):
         return Camera.ccw(A, C, D) != Camera.ccw(B, C, D) and Camera.ccw(A, B, C) != Camera.ccw(A, B, D)
@@ -47,7 +90,7 @@ class Camera(BaseCamera):
         device = unique_name[1]
         show_detections = False
         last_api_update = time.time()
-        api_update_interval = 2  # seconds
+        api_update_interval = 2
 
         gdet = import_module('tools.generate_detections')
         nn_matching = import_module('deep_sort.nn_matching')
@@ -65,54 +108,58 @@ class Camera(BaseCamera):
         nms_max_overlap = 1.0
         num_frames = 0
 
-        # Counters
-        entry_count = 0
-        exit_count = 0
-        
-        # Parking spot tracking - one car per spot at a time
-        parking_spots = {
-            1: {"occupied": False, "current_car": None, "history": deque(maxlen=50)},
-            2: {"occupied": False, "current_car": None, "history": deque(maxlen=50)},
-            3: {"occupied": False, "current_car": None, "history": deque(maxlen=50)},
-            4: {"occupied": False, "current_car": None, "history": deque(maxlen=50)}
+        VEHICLE_CLASSES = ['car', 'motorcycle', 'bus', 'truck']
+
+        # ===== Camera 0 Variables (OCR Detection Station) =====
+        cam0_vehicle_labels = {}
+        cam0_vehicle_count = 0
+        cam0_ocr_queue = []  # Queue OCR requests to avoid overwhelming API
+
+        # ===== Camera 1 Variables (Parking Lot - 3 horizontal spots) =====
+        cam1_entry_count = 0
+        cam1_exit_count = 0
+        cam1_parking_spots = {
+            1: {"occupied": False, "current_car": None, "plate": None, "history": deque(maxlen=50)},
+            2: {"occupied": False, "current_car": None, "plate": None, "history": deque(maxlen=50)},
+            3: {"occupied": False, "current_car": None, "plate": None, "history": deque(maxlen=50)}
         }
-        
-        # Track which vehicles crossed which lines
-        already_counted_entry = deque(maxlen=50)
-        already_counted_spots = {1: deque(maxlen=30), 2: deque(maxlen=30), 
-                                3: deque(maxlen=30), 4: deque(maxlen=30)}
-        
-        # Store OCR results per vehicle
-        vehicle_labels = {}  # {track_id: "PLATE1234"}
-        
-        memory = {}
+        cam1_already_counted_entry = deque(maxlen=50)
+        cam1_already_counted_spots = {1: deque(maxlen=30), 2: deque(maxlen=30), 3: deque(maxlen=30)}
+        cam1_vehicle_plates = {}  # Maps track_id to plate number
+        cam1_memory = {}
+        cam1_pending_entry_vehicles = deque(maxlen=10)  # Track vehicles that just entered
 
         while True:
             cam_id, frame = image_hub.recv_image()
             image_hub.send_reply(b'OK')
             
             if frame is None:
-                break
+                print(f"⚠️ [{cam_id}] Received None frame, skipping...")
+                continue
 
             num_frames += 1
             h, w = frame.shape[:2]
 
-            # Define lines - 2x2 GRID CONFIGURATION
-            # Vertical entry/exit line (left side)
-            entry_line = [(int(0.15 * w), 0), (int(0.15 * w), h)]
-            
-            # Horizontal parking spot lines in 2x2 grid
-            # Top row (spots 1 and 2)
-            spot_lines = {
-                1: [(int(0.2 * w), int(0.30 * h)), (int(0.48 * w), int(0.30 * h))],   # Top-left
-                2: [(int(0.52 * w), int(0.30 * h)), (int(0.80 * w), int(0.30 * h))],  # Top-right
-                # Bottom row (spots 3 and 4)
-                3: [(int(0.2 * w), int(0.70 * h)), (int(0.48 * w), int(0.70 * h))],   # Bottom-left
-                4: [(int(0.52 * w), int(0.70 * h)), (int(0.80 * w), int(0.70 * h))]   # Bottom-right
-            }
+            is_camera_0 = (cam_id == 'Camera 0')
+            is_camera_1 = (cam_id == 'Camera 1')
 
+            # Run YOLO detection
             image = Image.fromarray(frame[..., ::-1])
             boxes, confidence, classes = yolo.detect_image(image)
+            
+            if len(boxes) == 0:
+                # No detections, just yield frame
+                if is_camera_0:
+                    cv2.putText(frame, f"Total Vehicles: {cam0_vehicle_count}", 
+                            (int(0.02 * w), int(0.05 * h)), cv2.FONT_HERSHEY_SIMPLEX, 
+                            0.7, (0, 255, 255), 2)
+                elif is_camera_1:
+                    cv2.putText(frame, f"Entries: {cam1_entry_count} | Exits: {cam1_exit_count}", 
+                            (int(0.02 * w), int(0.05 * h)), cv2.FONT_HERSHEY_SIMPLEX, 
+                            0.7, (0, 255, 255), 2)
+                yield cam_id, frame
+                continue
+            
             features = encoder(frame, boxes)
 
             detections = [Detection(bbox, confidence, cls, feature) for bbox, confidence, cls, feature in
@@ -127,175 +174,218 @@ class Camera(BaseCamera):
             tracker.predict()
             tracker.update(detections)
 
-            # Draw entry/exit line (RED vertical)
-            cv2.line(frame, entry_line[0], entry_line[1], (0, 0, 255), 3)
-            cv2.putText(frame, "ENTRY/EXIT", (entry_line[0][0] - 50, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-            # Draw parking spot lines (RED horizontal) in 2x2 grid
-            for spot_id, line in spot_lines.items():
-                cv2.line(frame, line[0], line[1], (0, 0, 255), 2)
-                # Position labels above each line
-                label_x = (line[0][0] + line[1][0]) // 2 - 40
-                label_y = line[0][1] - 10
-                cv2.putText(frame, f"SPOT {spot_id}", (label_x, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-            for track in tracker.tracks:
-                if not track.is_confirmed() or track.time_since_update > 1:
-                    continue
+            # ========== CAMERA 0: OCR DETECTION STATION ==========
+            if is_camera_0:
+                for track in tracker.tracks:
+                    if not track.is_confirmed() or track.time_since_update > 1:
+                        continue
                     
-                bbox = track.to_tlbr()
-                track_cls = track.cls
-                track_id = track.track_id
+                    bbox = track.to_tlbr()
+                    track_cls = track.cls
+                    track_id = track.track_id
 
-                midpoint = track.tlbr_midpoint(bbox)
-                origin_midpoint = (midpoint[0], h - midpoint[1])
+                    if track_cls not in VEHICLE_CLASSES:
+                        continue
 
-                if track_id not in memory:
-                    memory[track_id] = deque(maxlen=2)
+                    midpoint = track.tlbr_midpoint(bbox)
 
-                memory[track_id].append(midpoint)
+                    # New vehicle detected - run OCR and register
+                    if track_id not in cam0_vehicle_labels:
+                        cam0_vehicle_count += 1
+                        print(f"🚗 [Camera 0] New vehicle! ID {track_id} (Total: {cam0_vehicle_count})")
+                        print(f"🔍 [Camera 0] Running OCR for ID {track_id}...")
+                        
+                        ocr_result = capture_and_ocr(frame, bbox)
+                        cam0_vehicle_labels[track_id] = ocr_result
+                        
+                        # Register in shared database for Camera 1
+                        register_vehicle_plate(track_id, ocr_result)
+                        
+                        print(f"✅ [Camera 0] ID {track_id} -> {ocr_result}")
+
+                    # Draw bounding box
+                    cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), 
+                                (0, 255, 0), 2)
+                    
+                    # Display ID and plate
+                    label_text = f"ID: {track_id}"
+                    if track_id in cam0_vehicle_labels:
+                        label_text += f" | {cam0_vehicle_labels[track_id]}"
+                    
+                    cv2.putText(frame, label_text, (int(bbox[0]), int(bbox[1] - 10)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    
+                    cv2.putText(frame, f"Type: {track_cls}", (int(bbox[0]), int(bbox[3] + 20)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                    
+                    cv2.circle(frame, midpoint, 4, (0, 255, 0), -1)
+
+                cv2.putText(frame, f"Total Vehicles: {cam0_vehicle_count}", 
+                        (int(0.02 * w), int(0.05 * h)), cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.7, (0, 255, 255), 2)
+
+            # ========== CAMERA 1: PARKING LOT (3 HORIZONTAL SPOTS) ==========
+            elif is_camera_1:
+                memory = cam1_memory
                 
-                if len(memory[track_id]) < 2:
-                    continue
-                    
-                previous_midpoint = memory[track_id][0]
-                origin_previous_midpoint = (previous_midpoint[0], h - previous_midpoint[1])
+                # Define entry line (vertical, left side)
+                entry_line = [(int(0.35 * w), 0), (int(0.35 * w), h)]
+                
+                # 3 horizontal parking spots at top (evenly spaced)
+                spot_y = int(0.35 * h)  # 25% down from top
+                spot_lines = {
+                    1: [(int(0.40 * w), spot_y), (int(0.55 * w), spot_y)],  # Left
+                    2: [(int(0.60 * w), spot_y), (int(0.75 * w), spot_y)],  # Center
+                    3: [(int(0.80 * w), spot_y), (int(0.95 * w), spot_y)]   # Right
+                }
 
-                # Draw tracking line
-                cv2.line(frame, midpoint, previous_midpoint, (0, 255, 0), 2)
+                # Draw entry line
+                cv2.line(frame, entry_line[0], entry_line[1], (0, 0, 255), 3)
+                cv2.putText(frame, "ENTRY/EXIT", (entry_line[0][0] - 50, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-                # Check entry/exit line crossing
-                if Camera.intersect(midpoint, previous_midpoint, entry_line[0], entry_line[1]):
-                    if track_id not in already_counted_entry:
-                        angle = Camera.vector_angle(origin_midpoint, origin_previous_midpoint)
-                        
-                        # Determine direction (left to right = entry, right to left = exit)
-                        if -90 < angle < 90:  # Moving right (entry)
-                            entry_count += 1
-                            cv2.line(frame, entry_line[0], entry_line[1], (0, 255, 0), 3)
-                            
-                            # Get OCR label for new entry using Gemini
-                            if track_id not in vehicle_labels:
-                                print(f"🔍 Running OCR for vehicle ID {track_id}...")
-                                ocr_result = call_ocr_api(frame, bbox)
-                                vehicle_labels[track_id] = ocr_result
-                                print(f"🚗 New Entry: ID {track_id} -> {ocr_result}")
-                        else:  # Moving left (exit)
-                            exit_count += 1
-                            cv2.line(frame, entry_line[0], entry_line[1], (255, 0, 0), 3)
-                            print(f"🚗 Exit: ID {track_id}")
-                        
-                        already_counted_entry.append(track_id)
-
-                # Check parking spot line crossings
+                # Draw parking spot lines
                 for spot_id, line in spot_lines.items():
-                    if Camera.intersect(midpoint, previous_midpoint, line[0], line[1]):
-                        if track_id not in already_counted_spots[spot_id]:
+                    color = (0, 255, 0) if not cam1_parking_spots[spot_id]['occupied'] else (0, 0, 255)
+                    cv2.line(frame, line[0], line[1], color, 3)
+                    label_x = (line[0][0] + line[1][0]) // 2 - 40
+                    label_y = line[0][1] - 10
+                    cv2.putText(frame, f"SPOT {spot_id}", (label_x, label_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                for track in tracker.tracks:
+                    if not track.is_confirmed() or track.time_since_update > 1:
+                        continue
+                        
+                    bbox = track.to_tlbr()
+                    track_cls = track.cls
+                    track_id = track.track_id
+
+                    if track_cls not in VEHICLE_CLASSES:
+                        continue
+
+                    midpoint = track.tlbr_midpoint(bbox)
+                    origin_midpoint = (midpoint[0], h - midpoint[1])
+
+                    if track_id not in memory:
+                        memory[track_id] = deque(maxlen=2)
+
+                    memory[track_id].append(midpoint)
+                    
+                    if len(memory[track_id]) < 2:
+                        continue
+                        
+                    previous_midpoint = memory[track_id][0]
+                    origin_previous_midpoint = (previous_midpoint[0], h - previous_midpoint[1])
+
+                    cv2.line(frame, midpoint, previous_midpoint, (0, 255, 0), 2)
+
+                    # Check entry/exit line
+                    if Camera.intersect(midpoint, previous_midpoint, entry_line[0], entry_line[1]):
+                        if track_id not in cam1_already_counted_entry:
                             angle = Camera.vector_angle(origin_midpoint, origin_previous_midpoint)
                             
-                            # Determine if it's entry or exit based on spot and direction
-                            is_entry = False
-                            if spot_id in [1, 2]:  # Spots 1 and 2: up = entry, down = exit
-                                is_entry = angle > 0
-                            else:  # Spots 3 and 4: down = entry, up = exit
+                            if -90 < angle < 90:  # Entry (left to right)
+                                cam1_entry_count += 1
+                                cv2.line(frame, entry_line[0], entry_line[1], (0, 255, 0), 3)
+                                
+                                # Assign next available plate from Camera 0
+                                plate = get_next_available_plate()
+                                cam1_vehicle_plates[track_id] = plate
+                                cam1_pending_entry_vehicles.append(track_id)
+                                
+                                print(f"🚗 [Camera 1] Entry: ID {track_id} | Assigned Plate: {plate}")
+                            else:  # Exit (right to left)
+                                cam1_exit_count += 1
+                                cv2.line(frame, entry_line[0], entry_line[1], (255, 0, 0), 3)
+                                print(f"🚗 [Camera 1] Exit: ID {track_id}")
+                            
+                            cam1_already_counted_entry.append(track_id)
+
+                    # Check parking spots (all use downward entry logic)
+                    for spot_id, line in spot_lines.items():
+                        if Camera.intersect(midpoint, previous_midpoint, line[0], line[1]):
+                            if track_id not in cam1_already_counted_spots[spot_id]:
+                                angle = Camera.vector_angle(origin_midpoint, origin_previous_midpoint)
+                                
+                                # For horizontal lines at top: negative angle = downward = entry
                                 is_entry = angle < 0
-                            
-                            if is_entry:
-                                # Car entering parking spot
-                                parking_spots[spot_id]['occupied'] = True
-                                parking_spots[spot_id]['current_car'] = track_id
-                                parking_spots[spot_id]['history'].append(track_id)
                                 
-                                # Flash the line green for entry
-                                cv2.line(frame, line[0], line[1], (0, 255, 0), 3)
+                                if is_entry:
+                                    cam1_parking_spots[spot_id]['occupied'] = True
+                                    cam1_parking_spots[spot_id]['current_car'] = track_id
+                                    cam1_parking_spots[spot_id]['plate'] = cam1_vehicle_plates.get(track_id, "UNKNOWN")
+                                    cam1_parking_spots[spot_id]['history'].append(track_id)
+                                    cv2.line(frame, line[0], line[1], (0, 255, 0), 5)
+                                    
+                                    mock_api_call(track_id, spot_id, cam1_vehicle_plates.get(track_id, "UNKNOWN"))
+                                    print(f"🅿️  [Camera 1] Spot {spot_id}: ID {track_id} ({cam1_vehicle_plates.get(track_id, 'UNKNOWN')}) PARKED")
+                                else:
+                                    if cam1_parking_spots[spot_id]['current_car'] == track_id:
+                                        cam1_parking_spots[spot_id]['occupied'] = False
+                                        cam1_parking_spots[spot_id]['current_car'] = None
+                                        cam1_parking_spots[spot_id]['plate'] = None
+                                    cv2.line(frame, line[0], line[1], (255, 0, 0), 5)
+                                    print(f"🅿️  [Camera 1] Spot {spot_id}: ID {track_id} LEFT")
                                 
-                                # Mock API call
-                                mock_api_call(track_id, spot_id)
-                                print(f"🅿️  Spot {spot_id}: Car {track_id} ENTERED (parked)")
-                            else:
-                                # Car exiting parking spot
-                                if parking_spots[spot_id]['current_car'] == track_id:
-                                    parking_spots[spot_id]['occupied'] = False
-                                    parking_spots[spot_id]['current_car'] = None
-                                
-                                # Flash the line blue for exit
-                                cv2.line(frame, line[0], line[1], (255, 0, 0), 3)
-                                
-                                print(f"🅿️  Spot {spot_id}: Car {track_id} EXITED (left)")
-                            
-                            already_counted_spots[spot_id].append(track_id)
+                                cam1_already_counted_spots[spot_id].append(track_id)
 
-                # Draw bounding box
-                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), 
-                            (255, 255, 255), 2)
-                
-                # Display ID and OCR label
-                label_text = f"ID: {track_id}"
-                if track_id in vehicle_labels:
-                    label_text += f" | {vehicle_labels[track_id]}"
-                
-                cv2.putText(frame, label_text, (int(bbox[0]), int(bbox[1] - 10)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                
-                # Display X,Y coordinates
-                coord_text = f"X:{midpoint[0]} Y:{midpoint[1]}"
-                cv2.putText(frame, coord_text, (int(bbox[0]), int(bbox[3] + 20)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
-                
-                # Draw center point marker
-                cv2.circle(frame, midpoint, 4, (255, 0, 255), -1)
+                    # Draw bounding box
+                    cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), 
+                                (255, 255, 255), 2)
+                    
+                    # Display ID and plate
+                    plate = cam1_vehicle_plates.get(track_id, "UNKNOWN")
+                    label_text = f"ID: {track_id} | {plate}"
+                    
+                    cv2.putText(frame, label_text, (int(bbox[0]), int(bbox[1] - 10)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    
+                    cv2.circle(frame, midpoint, 4, (255, 0, 255), -1)
 
-            # Display entry/exit counts
-            cv2.putText(frame, f"Entries: {entry_count} | Exits: {exit_count}", 
-                    (int(0.02 * w), int(0.05 * h)), cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.7, (0, 255, 255), 2)
+                # Display counts
+                cv2.putText(frame, f"Entries: {cam1_entry_count} | Exits: {cam1_exit_count}", 
+                        (int(0.02 * w), int(0.05 * h)), cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.7, (0, 255, 255), 2)
 
-            # Display parking spot information
-            y_offset = int(0.05 * h)
-            for spot_id in sorted(parking_spots.keys()):
-                spot_data = parking_spots[spot_id]
-                status = "🚗 OCCUPIED" if spot_data['occupied'] else "✅ EMPTY"
-                info_text = f"Spot {spot_id}: {status}"
+                # Display parking status (horizontal at bottom)
+                status_y = int(0.92 * h)
+                for spot_id in sorted(cam1_parking_spots.keys()):
+                    spot_data = cam1_parking_spots[spot_id]
+                    status = "OCCUPIED" if spot_data['occupied'] else "EMPTY"
+                    color = (0, 0, 255) if spot_data['occupied'] else (0, 255, 0)
+                    
+                    # Position status below each spot
+                    spot_center_x = (spot_lines[spot_id][0][0] + spot_lines[spot_id][1][0]) // 2
+                    
+                    cv2.putText(frame, f"S{spot_id}: {status}", (spot_center_x - 50, status_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    if spot_data['occupied'] and spot_data['plate']:
+                        cv2.putText(frame, spot_data['plate'], (spot_center_x - 40, status_y + 20), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+                # Periodic API
+                all_active_tracks = set([track.track_id for track in tracker.tracks 
+                                        if track.is_confirmed() and track.time_since_update <= 1])
                 
-                cv2.putText(frame, info_text, (int(0.65 * w), y_offset), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
-                        (0, 0, 255) if spot_data['occupied'] else (0, 255, 0), 2)
-                
-                # Show current car if occupied
-                if spot_data['occupied'] and spot_data['current_car']:
-                    car_id = spot_data['current_car']
-                    label = vehicle_labels.get(car_id, "UNKNOWN")
-                    car_text = f"  Car: {car_id} ({label})"
-                    cv2.putText(frame, car_text, (int(0.65 * w), y_offset + 20), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    y_offset += 60
-                else:
-                    y_offset += 35
+                current_time = time.time()
+                if current_time - last_api_update >= api_update_interval:
+                    send_live_parking_status(cam1_parking_spots, cam1_vehicle_plates, 
+                                            cam1_entry_count, cam1_exit_count, memory, all_active_tracks)
+                    last_api_update = current_time
 
-            # Collect all currently active track IDs
-            all_active_tracks = set([track.track_id for track in tracker.tracks 
-                                    if track.is_confirmed() and track.time_since_update <= 1])
-            
-            # Periodic live parking status API call
-            current_time = time.time()
-            if current_time - last_api_update >= api_update_interval:
-                send_live_parking_status(parking_spots, vehicle_labels, entry_count, exit_count, 
-                                        memory, all_active_tracks)
-                last_api_update = current_time
-
-            # Clean up old memory
-            if len(memory) > 50:
-                del memory[list(memory)[0]]
+                if len(memory) > 50:
+                    del memory[list(memory)[0]]
 
             yield cam_id, frame
-# Gemini API Configuration
-API_KEY = "AIzaSyAIaU_xYpM2izZuisoevZLF5wxSxTKXxUw"  # 🔑 Add your Gemini API key
+
 
 # ======================================
-# Gemini OCR Functions (DO NOT MODIFY)
+# Gemini OCR Functions
 # ======================================
+API_KEY = "AIzaSyAIaU_xYpM2izZuisoevZLF5wxSxTKXxUw"
+
 def upload_file(file_path, mime_type):
     url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key={API_KEY}"
     metadata = {"file": {"displayName": file_path.split('/')[-1]}}
@@ -315,46 +405,28 @@ def upload_file(file_path, mime_type):
     r = requests.post(url, headers=headers, data=data)
     r.raise_for_status()
     result = r.json()["file"]
-    print(f"✅ Uploaded: {result['displayName']}")
     return result["uri"], result["name"]
 
 
 def delete_file(file_name):
     url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={API_KEY}"
     r = requests.delete(url)
-    if r.status_code == 200:
-        print(f"🗑️ Deleted {file_name}")
-    else:
-        print(f"⚠️ Failed to delete {file_name}: {r.status_code} - {r.text}")
 
 
 def extract_plate_ocr(image_path):
-    """Extract license plate using Gemini API"""
     try:
-        # Upload to Gemini
         reference_uri, reference_name = upload_file(image_path, "image/jpeg")
 
-        # Call Gemini API
         gen_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         headers = {"Content-Type": "application/json", "x-goog-api-key": API_KEY}
 
         payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "fileData": {"fileUri": reference_uri, "mimeType": "image/jpeg"}
-                        },
-                        {
-                            "text": (
-                                "From the image, extract only the unique, primary alphanumeric code of the vehicle's license plate. "
-                                "Do not include any surrounding words, labels, prefixes, or suffixes such as 'REGISTERED', "
-                                "'NCR MV FILE NO.', or hyphens. Respond with nothing but the exact code."
-                            )
-                        }
-                    ]
-                }
-            ]
+            "contents": [{
+                "parts": [
+                    {"fileData": {"fileUri": reference_uri, "mimeType": "image/jpeg"}},
+                    {"text": "Extract only the vehicle license plate alphanumeric code. No prefixes, suffixes, or labels. Just the code."}
+                ]
+            }]
         }
 
         resp = requests.post(gen_url, headers=headers, json=payload)
@@ -363,7 +435,6 @@ def extract_plate_ocr(image_path):
         result = resp.json()
         plate_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-        # Cleanup uploaded file
         delete_file(reference_name)
         
         return plate_text
@@ -372,81 +443,76 @@ def extract_plate_ocr(image_path):
         return "UNKNOWN"
 
 
-def call_ocr_api(frame, bbox):
-    """Wrapper to extract OCR from vehicle crop"""
+def capture_and_ocr(frame, bbox):
     try:
+        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
         
-        # Save temporary image
-        temp_path = "testpic.png"
+        # Add padding to crop
+        pad = 10
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(frame.shape[1], x2 + pad)
+        y2 = min(frame.shape[0], y2 + pad)
         
-        # Call Gemini OCR
+        vehicle_crop = frame[y1:y2, x1:x2]
+        
+        timestamp = int(time.time() * 1000)
+        temp_path = f"vehicle_crop_{timestamp}.jpg"
+        cv2.imwrite(temp_path, vehicle_crop)
+        
         result = extract_plate_ocr(temp_path)
         
+        try:
+            os.remove(temp_path)
+        except:
+            pass
             
         return result
     except Exception as e:
-        print(f"OCR Wrapper Error: {e}")
+        print(f"Capture Error: {e}")
         return "ERROR"
 
 
-def mock_api_call(car_id, spot_id):
-    """Simulate API call for parking spot occupation"""
+def mock_api_call(car_id, spot_id, plate):
     def send_request():
         payload = {
             "car_id": car_id,
             "spot_id": spot_id,
+            "plate": plate,
             "timestamp": datetime.datetime.now().isoformat()
         }
-        print(f"📡 API Call: {payload}")
-        # Uncomment below to make actual API call
-        # try:
-        #     response = requests.post("YOUR_API_ENDPOINT", json=payload, timeout=5)
-        #     print(f"API Response: {response.status_code}")
-        # except Exception as e:
-        #     print(f"API Error: {e}")
+        print(f"📡 API: {payload}")
     
     threading.Thread(target=send_request, daemon=True).start()
 
-def send_live_parking_status(parking_spots, vehicle_labels, entry_count, exit_count, memory, all_active_tracks):
-    """Send periodic live parking status to API"""
+
+def send_live_parking_status(parking_spots, vehicle_plates, entry_count, exit_count, memory, all_active_tracks):
     def send_request():
-        # Prepare data for ALL currently tracked cars
         all_cars = []
         for track_id in all_active_tracks:
-            # Get current coordinates from memory
             car_position = {"x": None, "y": None}
             if track_id in memory and len(memory[track_id]) > 0:
-                current_pos = memory[track_id][-1]  # Get most recent position
+                current_pos = memory[track_id][-1]
                 car_position = {"x": int(current_pos[0]), "y": int(current_pos[1])}
             
             all_cars.append({
                 "car_id": track_id,
-                "label": vehicle_labels.get(track_id, "UNKNOWN"),
+                "plate": vehicle_plates.get(track_id, "UNKNOWN"),
                 "coordinates": car_position
             })
         
-        # Prepare parking spots data
         spots_data = []
         for spot_id, data in parking_spots.items():
             spot_info = {
                 "spot_id": spot_id,
                 "occupied": data['occupied'],
-                "current_car": None,
-                "history": list(data['history'])  # Convert deque to list for JSON
+                "current_car": None
             }
             
-            # If occupied, include current car details
             if data['current_car'] is not None:
-                car_id = data['current_car']
-                car_position = {"x": None, "y": None}
-                if car_id in memory and len(memory[car_id]) > 0:
-                    current_pos = memory[car_id][-1]
-                    car_position = {"x": int(current_pos[0]), "y": int(current_pos[1])}
-                
                 spot_info['current_car'] = {
-                    "car_id": car_id,
-                    "label": vehicle_labels.get(car_id, "UNKNOWN"),
-                    "coordinates": car_position
+                    "car_id": data['current_car'],
+                    "plate": data['plate']
                 }
             
             spots_data.append(spot_info)
@@ -459,15 +525,7 @@ def send_live_parking_status(parking_spots, vehicle_labels, entry_count, exit_co
             "parking_spots": spots_data
         }
         
-        print(f"📊 Live Status API Call:")
+        print(f"📊 Live Status:")
         print(json.dumps(payload, indent=2))
-        
-        # Uncomment below to make actual API call
-        # try:
-        #     response = requests.post("YOUR_LIVE_STATUS_ENDPOINT", json=payload, timeout=5)
-        #     print(f"Live Status API Response: {response.status_code}")
-        # except Exception as e:
-        #     print(f"Live Status API Error: {e}")
     
-    # Run API call in separate thread
     threading.Thread(target=send_request, daemon=True).start()
